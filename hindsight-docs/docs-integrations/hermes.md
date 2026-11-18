@@ -376,18 +376,22 @@ Available in `hybrid` and `tools` memory modes:
 | Tool | Description |
 |------|-------------|
 | `hindsight_retain` | Store information with auto entity extraction; supports optional per-call `tags` |
-| `hindsight_recall` | Multi-strategy search (semantic + entity graph); returns each result's `memory_id`, `bank_id`, and `type`; optional `types` overrides `recall_types` for that call |
+| `hindsight_recall` | Multi-strategy search (semantic + entity graph); optional `types` overrides `recall_types` for that call and includes `memory_id` and `type`, plus `bank_id` when multiple banks are searched |
 | `hindsight_reflect` | Cross-memory synthesis (LLM-powered) |
 | `hindsight_invalidate` | Soft-retire one incorrect or outdated raw fact by `memory_id`, with an optional `reason` and `bank_id` (defaults to the primary bank) |
 
 To correct an obsolete fact, first use `hindsight_recall` with `types: ["world", "experience"]`,
-then pass the matching fact's `memory_id` and `bank_id` to `hindsight_invalidate`. Observations are
-derived and cannot be invalidated directly. Invalidation excludes the raw fact from recall,
-consolidation, and the knowledge graph and recomputes derived observations without it; the fact
-is kept for audit and can be restored through the server's curation API. It is not permanently deleted.
+then pass the matching fact's `memory_id` and, when shown, `bank_id` to `hindsight_invalidate`.
+With explicit `types`, each bank's copy is listed separately. Without `types`, recall keeps its
+usual text format and deduplication. Observations are derived and cannot be invalidated directly.
+Invalidation archives this raw fact and removes observations linked to it. Surviving evidence is
+queued for rebuilding when automatic consolidation is enabled. Other copies or later retains may
+still assert the same information. The fact is kept for audit, not permanently deleted.
+Restoration is outside the Hermes tool; use the server's curation API or MCP's restore option.
 Store the replacement fact with `hindsight_retain` when needed.
 
-Invalidation targets exactly one writable bank and never fans out to mirrors. Banks configured only
+Invalidation targets exactly one writable bank and never fans out to mirrors. Copies in other
+writable banks need their own `hindsight_invalidate` call. Banks configured only
 under `recall_additional_banks` are rejected. The tool is available by default alongside retain,
 recall, and reflect in `hybrid` and `tools` modes; `context` mode exposes no tools.
 
