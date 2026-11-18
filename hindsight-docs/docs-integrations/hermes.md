@@ -295,7 +295,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 >
 > Per [Hindsight's docs](/developer/observations), observations are the **consolidated** knowledge layer Hindsight builds on top of raw facts: deduplicated beliefs grounded in evidence, refined as new facts arrive, with proof counts and freshness signals. Raw `world` / `experience` facts are the individual supporting evidence that feeds them. For per-turn context injection, observations are denser per token and avoid feeding the model multiple raw facts that one observation already summarizes.
 >
-> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
+> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool. The tool also accepts an optional per-call `types` list, so it can find raw facts for invalidation without changing automatic recall or the configured default.
 
 > **Tip — `recall_min_scores` against off-topic recall.** Recall ranks, it does not judge relevance: a question
 > unrelated to anything stored still comes back with up to `recall_max_tokens` of the least-bad memories. The
@@ -376,8 +376,20 @@ Available in `hybrid` and `tools` memory modes:
 | Tool | Description |
 |------|-------------|
 | `hindsight_retain` | Store information with auto entity extraction; supports optional per-call `tags` |
-| `hindsight_recall` | Multi-strategy search (semantic + entity graph) |
+| `hindsight_recall` | Multi-strategy search (semantic + entity graph); returns each result's `memory_id`, `bank_id`, and `type`; optional `types` overrides `recall_types` for that call |
 | `hindsight_reflect` | Cross-memory synthesis (LLM-powered) |
+| `hindsight_invalidate` | Soft-retire one incorrect or outdated raw fact by `memory_id`, with an optional `reason` and `bank_id` (defaults to the primary bank) |
+
+To correct an obsolete fact, first use `hindsight_recall` with `types: ["world", "experience"]`,
+then pass the matching fact's `memory_id` and `bank_id` to `hindsight_invalidate`. Observations are
+derived and cannot be invalidated directly. Invalidation excludes the raw fact from recall,
+consolidation, and the knowledge graph and recomputes derived observations without it; the fact
+is kept for audit and can be restored through the server's curation API. It is not permanently deleted.
+Store the replacement fact with `hindsight_retain` when needed.
+
+Invalidation targets exactly one writable bank and never fans out to mirrors. Banks configured only
+under `recall_additional_banks` are rejected. The tool is available by default alongside retain,
+recall, and reflect in `hybrid` and `tools` modes; `context` mode exposes no tools.
 
 ## Environment Variables
 
