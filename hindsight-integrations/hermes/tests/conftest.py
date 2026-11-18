@@ -204,7 +204,7 @@ class FakeClient:
 
     async def _update_memory(self, **kwargs):
         self.updates.append(kwargs)
-        return {"id": kwargs["memory_id"], "state": "invalidated"}
+        return {"id": kwargs["memory_id"], "state": "invalidated", "text": "User lives in Porto."}
 
     async def aclose(self):
         pass

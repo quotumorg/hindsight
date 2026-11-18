@@ -26,14 +26,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-if TYPE_CHECKING:
-    from hindsight_client_api.models.recall_result import RecallResult
-
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+from pydantic import BaseModel
 from tools.registry import tool_error
 from utils import read_json_or_empty
 
@@ -82,12 +80,16 @@ from .settings import (
     _template_fields,
 )
 
+if TYPE_CHECKING:
+    from hindsight_client_api.models.recall_result import RecallResult
+
 logger = logging.getLogger(__name__)
 
 _LOCAL_MODES = {"local", "local_embedded"}
 # Share of the operation timeout an extra recall bank may use, so a slow extra bank
 # always gives up before the operation that also carries the primary's result does.
 _EXTRA_BANK_TIMEOUT_SHARE = 0.8
+_VALID_RECALL_TYPES = ("world", "experience", "observation")
 # How long an extra bank is skipped after it fails, for recall and writes alike, so an
 # unreachable bank costs one timeout per cooldown instead of one on every turn.
 _EXTRA_BANK_COOLDOWN = 300.0
@@ -387,7 +389,8 @@ RECALL_SCHEMA = {
     "description": (
         "Search long-term memory. Returns memories ranked by relevance using "
         "semantic search, keyword matching, entity graph traversal, and reranking. "
-        "Each result includes its memory_id, bank_id, and type. "
+        "With explicit types, results include memory_id and type, plus bank_id when multiple banks are searched. "
+        "Each bank copy is listed separately for curation. "
         "To find facts to invalidate, pass types=['world', 'experience']; observations cannot be invalidated."
     ),
     "parameters": {
@@ -423,9 +426,12 @@ INVALIDATE_SCHEMA = {
     "name": "hindsight_invalidate",
     "description": (
         "Soft-retire an incorrect or outdated world/experience fact identified by hindsight_recall. "
-        "It is excluded from recall, consolidation, and the knowledge graph; derived observations are "
-        "recomputed without it. Kept for audit and reversible on the server, not permanently deleted. "
-        "Observations cannot be invalidated. Targets one writable bank only."
+        "Archives this raw fact and removes observations linked to it. "
+        "Surviving evidence is queued for rebuilding when automatic consolidation is enabled. "
+        "Other copies or later retains may still assert the same information. "
+        "Kept for audit; restore through the server curation API, not this tool. "
+        "Observations cannot be invalidated. Targets one writable bank only; "
+        "copies in other writable banks need their own call."
     ),
     "parameters": {
         "type": "object",
@@ -448,6 +454,14 @@ class _BankRecallResult:
 
     bank_id: str
     memory: RecallResult
+    multiple_banks: bool
+
+
+class _MemoryCurationResult(BaseModel):
+    """The curation endpoint returns an otherwise untyped JSON object."""
+
+    state: str
+    text: str
 
 
 def _bank_not_written_yet(exc: Exception) -> bool:
@@ -1730,10 +1744,11 @@ class HindsightMemoryProvider(MemoryProvider):
     def _recall(self, query: str) -> list:
         return [result.memory for result in self._recall_with_banks(query)]
 
-    def _recall_with_banks(self, query: str, *, types: list[str] | None = None) -> list[_BankRecallResult]:
+    def _recall_with_banks(self, query: str, *, types: Optional[List[str]] = None) -> List[_BankRecallResult]:
         """Semantic recall across the write set (primary bank first, then
         mirrors/additional banks), then any recall-only banks. A result whose text an
-        earlier bank already returned is dropped.
+        earlier bank already returned is dropped unless ``types`` is explicit, so
+        curation can address each copy independently.
 
         All banks are queried concurrently, each with the configured budget and
         ``recall_max_tokens``. A primary-bank failure raises, exactly as the
@@ -1790,8 +1805,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 bank_results = [r for r in bank_results if _clears_min_scores(r, self._recall_min_scores)]
             # Drop only what an earlier bank already returned; one bank's own answer passes
             # through untouched, so a single-bank recall is exactly the server's response.
-            kept = [r for r in bank_results if getattr(r, "text", None) not in seen]
-            results.extend(_BankRecallResult(bank_id=bank_id, memory=r) for r in kept)
+            # Explicit types keep every bank's copy addressable for curation.
+            kept = (
+                bank_results if types is not None else [r for r in bank_results if getattr(r, "text", None) not in seen]
+            )
+            results.extend(_BankRecallResult(bank_id=bank_id, memory=r, multiple_banks=len(bank_ids) > 1) for r in kept)
             seen.update(text for r in kept if (text := getattr(r, "text", None)))
         return results
 
@@ -2182,17 +2200,18 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         types = args.get("types")
         if types is not None and (
-            not isinstance(types, list)
-            or not types
-            or any(t not in ("world", "experience", "observation") for t in types)
+            not isinstance(types, list) or not types or any(t not in _VALID_RECALL_TYPES for t in types)
         ):
             raise ValueError("types must be a non-empty list of world, experience, or observation")
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
         results = self._recall_with_banks(query, types=types)
         logger.debug("Tool hindsight_recall: %d results", len(results))
+        if types is None:
+            return "\n".join(f"{i}. {r.memory.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
         return (
             "\n".join(
-                f"{i}. [memory_id={r.memory.id}, bank_id={r.bank_id}, type={r.memory.type}] {r.memory.text}"
+                f"{i}. [memory_id={r.memory.id}, "
+                f"{f'bank_id={r.bank_id}, ' if r.multiple_banks else ''}type={r.memory.type}] {r.memory.text}"
                 for i, r in enumerate(results, 1)
             )
             or "No relevant memories found."
@@ -2209,18 +2228,16 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _tool_invalidate(self, args: dict) -> str:
         memory_id = args["memory_id"]
-        bank_id = args.get("bank_id", self._bank_id)
+        bank_id = args.get("bank_id") or self._bank_id
         # Recall includes read-only banks too. Curation must never fan out like retain,
         # or silently target the primary when the recalled fact belongs to another bank.
         if bank_id not in self._write_bank_ids:
             raise ValueError(f"Bank '{bank_id}' is not writable by this provider")
         from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest
 
-        request = UpdateMemoryRequest(state="invalidated")
-        if args.get("reason") is not None:
-            request.reason = args["reason"]
+        request = UpdateMemoryRequest(state="invalidated", reason=args.get("reason") or None)
         logger.debug("Tool hindsight_invalidate: bank=%s, memory_id=%s", bank_id, memory_id)
-        self._run_hindsight_operation(
+        response = self._run_hindsight_operation(
             lambda client: client.memory.update_memory(
                 bank_id=bank_id,
                 memory_id=memory_id,
@@ -2228,8 +2245,18 @@ class HindsightMemoryProvider(MemoryProvider):
                 _request_timeout=float(self._timeout or _DEFAULT_TIMEOUT),
             )
         )
+        # A completed cache or a worker started before this PATCH can still carry
+        # the retired fact. Retire both before Hermes can inject the next turn.
+        with self._prefetch_lock:
+            self._prefetch_generation += 1
+            self._prefetch_result, self._prefetch_count = "", 0
+        self._last_recall_returned, self._last_recall_count = False, 0
+        result = _MemoryCurationResult.model_validate(response)
         logger.debug("Tool hindsight_invalidate: success")
-        return "Memory invalidated (kept for audit, excluded from recall)."
+        return (
+            f"Memory state={result.state}: {result.text}\n"
+            "Copies in other writable banks need their own hindsight_invalidate call."
+        )
 
     # tool name -> (required arg, handler, user-facing failure prefix)
     _TOOL_HANDLERS = {
@@ -2242,8 +2269,6 @@ class HindsightMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
-        if self._memory_mode == "context":
-            return tool_error("Memory tools are unavailable in context mode")
         required, handler, failure = self._TOOL_HANDLERS[tool_name]
         if not args.get(required, ""):
             return tool_error(f"Missing required parameter: {required}")

@@ -116,10 +116,7 @@ def test_recall_tool_queries_the_bank_and_formats_results(provider):
     assert fake.recalls[0]["bank_id"] == "team"
     assert fake.recalls[0]["budget"] == "high"
     assert fake.recalls[0]["types"] == ["observation"]  # observation-only default
-    assert result["result"] == (
-        "1. [memory_id=memory-1, bank_id=team, type=observation] fact one\n"
-        "2. [memory_id=memory-2, bank_id=team, type=observation] fact two"
-    )
+    assert result["result"] == "1. fact one\n2. fact two"
     instance.shutdown()
 
 
@@ -165,7 +162,7 @@ def test_recall_min_scores_is_enforced_on_each_result_the_server_returns(provide
     results = [("kept", {"semantic": 0.7}), ("weak", {"semantic": 0.3}), ("other arm", {"semantic": None})]
     instance, fake = provider({"recall_min_scores": {"semantic": 0.5}}, client=FakeClient(recall_texts=results))
     result = json.loads(instance.handle_tool_call("hindsight_recall", {"query": "q"}))
-    assert result["result"] == "1. [memory_id=memory-1, bank_id=hermes, type=observation] kept"
+    assert result["result"] == "1. kept"
     assert fake.recalls[0]["min_scores"] == {"semantic": 0.5}
     instance.shutdown()
 
@@ -763,7 +760,7 @@ def test_reconnect_closes_the_client_it_replaces(provider, monkeypatch):
     monkeypatch.setattr(instance, "_new_embedded_client", lambda: fresh)
 
     result = json.loads(instance.handle_tool_call("hindsight_recall", {"query": "q"}))
-    assert result["result"] == "1. [memory_id=memory-1, bank_id=hermes, type=observation] back"
+    assert result["result"] == "1. back"
     assert Dead.closed
 
 
