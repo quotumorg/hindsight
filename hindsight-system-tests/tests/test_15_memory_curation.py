@@ -14,8 +14,8 @@ answers. The state machine has to say "this was here, and it is no longer true".
 from __future__ import annotations
 
 import pytest
-
-from hindsight_system_tests.payloads import consolidation, extracted, fact
+from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest
+from hindsight_system_tests.payloads import consolidation, extracted, fact, observes
 
 pytestmark = pytest.mark.asyncio
 
@@ -144,3 +144,60 @@ async def test_curating_one_memory_leaves_its_neighbour_alone(client, curated_ba
 
     response = await client.arecall(bank_id=curated_bank, query="Where does Alice live?")
     assert BERLIN in [r.text for r in response.results]
+
+
+async def test_invalidating_a_raw_source_rebuilds_observations_from_surviving_evidence(client, llm, bank_id, settled):
+    """Recall the raw ID, archive it, and let consolidation rebuild its shared
+    observation. Raw recall, observation recall, and the audit must agree."""
+    porto = "Alice lives in Porto | Involving: Alice"
+    before = "Alice lives in Porto and plays cello."
+    after = "Alice plays cello."
+    reason = "Porto was extracted incorrectly."
+    llm.on_step("extract_facts").returns(
+        extracted(
+            fact("Alice lives in Porto", who="Alice", entities=["Alice", "Porto"]),
+            fact("Alice plays cello", who="Alice", entities=["Alice", "cello"]),
+        )
+    )
+    llm.on_step("consolidate").answers_with(observes(before))
+    await client.aretain(bank_id=bank_id, content="Alice lives in Porto and plays cello.")
+    await settled(bank_id)
+
+    observations = await client.arecall(bank_id=bank_id, query="Alice", types=["observation"])
+    assert [r.text for r in observations.results] == [before]
+    assert [r.type for r in observations.results] == ["observation"]
+    raw = await client.arecall(bank_id=bank_id, query="Alice", types=["world", "experience"])
+    assert sorted(r.text for r in raw.results) == sorted([porto, CELLO])
+    assert [r.type for r in raw.results] == ["world", "world"]
+    [target] = [r for r in raw.results if r.text == porto]
+
+    llm.reset()
+    llm.on_step("consolidate").answers_with(observes(after))
+    request = UpdateMemoryRequest(state="invalidated", reason=reason)
+    result = await client.memory.update_memory(bank_id, target.id, request)
+    assert result["state"] == "invalidated"
+    assert result["text"] == porto
+    await settled(bank_id)
+
+    assert len(llm.prompts_for("consolidate")) >= 1, "the surviving evidence was never rebuilt"
+    # A replay must keep the same fact archived, including after background work.
+    replay = await client.memory.update_memory(bank_id, target.id, request)
+    assert replay["state"] == "invalidated" and replay["text"] == porto
+    await settled(bank_id)
+
+    raw = await client.arecall(bank_id=bank_id, query="Alice", types=["world", "experience"])
+    assert [r.text for r in raw.results] == [CELLO]
+    assert [r.type for r in raw.results] == ["world"]
+    observations = await client.arecall(bank_id=bank_id, query="Alice", types=["observation"])
+    assert [r.text for r in observations.results] == [after]
+    assert [r.type for r in observations.results] == ["observation"]
+    current = await client.memory.list_memories(bank_id, limit=100)
+    assert sorted(item.text for item in current.items) == sorted([CELLO, after])
+    archived = await client.memory.list_memories(bank_id, limit=100, state="invalidated")
+    assert archived.total == 1
+    [audit] = archived.items
+    assert audit.id == target.id
+    assert audit.text == porto
+    assert audit.state == "invalidated"
+    assert audit.invalidation_reason == reason
+    assert audit.invalidated_at is not None
