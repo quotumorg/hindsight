@@ -24,7 +24,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from hindsight_client_api.models.recall_result import RecallResult
 
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
@@ -383,12 +386,22 @@ RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
         "Search long-term memory. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking."
+        "semantic search, keyword matching, entity graph traversal, and reranking. "
+        "Each result includes its memory_id, bank_id, and type. "
+        "To find facts to invalidate, pass types=['world', 'experience']; observations cannot be invalidated."
     ),
     "parameters": {
         "type": "object",
         "required": ["query"],
-        "properties": {"query": {"type": "string", "description": "What to search for."}},
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "types": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["world", "experience", "observation"]},
+                "minItems": 1,
+                "description": "Optional fact types for this search only; omit to use configured recall_types.",
+            },
+        },
     },
 }
 
@@ -404,6 +417,37 @@ REFLECT_SCHEMA = {
         "properties": {"query": {"type": "string", "description": "The question to reflect on."}},
     },
 }
+
+
+INVALIDATE_SCHEMA = {
+    "name": "hindsight_invalidate",
+    "description": (
+        "Soft-retire an incorrect or outdated world/experience fact identified by hindsight_recall. "
+        "It is excluded from recall, consolidation, and the knowledge graph; derived observations are "
+        "recomputed without it. Kept for audit and reversible on the server, not permanently deleted. "
+        "Observations cannot be invalidated. Targets one writable bank only."
+    ),
+    "parameters": {
+        "type": "object",
+        "required": ["memory_id"],
+        "properties": {
+            "memory_id": {"type": "string", "description": "ID of the raw fact returned by hindsight_recall."},
+            "reason": {"type": "string", "description": "Optional reason recorded when invalidating."},
+            "bank_id": {
+                "type": "string",
+                "description": "Bank shown by hindsight_recall; omit for the current primary bank. Recall-only banks are rejected.",
+            },
+        },
+    },
+}
+
+
+@dataclass(frozen=True)
+class _BankRecallResult:
+    """Keep the source bank beside a result without mutating the SDK's model."""
+
+    bank_id: str
+    memory: RecallResult
 
 
 def _bank_not_written_yet(exc: Exception) -> bool:
@@ -502,7 +546,8 @@ _TOOL_GUIDANCE = (
     "Use hindsight_reflect for cross-session pattern synthesis. "
     "Use session_search only when you need verbatim transcripts or "
     "exact wording from a specific conversation. "
-    "Use hindsight_retain to store facts."
+    "Use hindsight_retain to store facts. "
+    "Use hindsight_invalidate to retire an incorrect or outdated raw fact after recalling its ID with types=['world', 'experience']."
 )
 _CONTEXT_NOTE = "Relevant memories are automatically injected into context."
 _SYSTEM_PROMPT_TAILS = {
@@ -1683,6 +1728,9 @@ class HindsightMemoryProvider(MemoryProvider):
         return why is not None
 
     def _recall(self, query: str) -> list:
+        return [result.memory for result in self._recall_with_banks(query)]
+
+    def _recall_with_banks(self, query: str, *, types: list[str] | None = None) -> list[_BankRecallResult]:
         """Semantic recall across the write set (primary bank first, then
         mirrors/additional banks), then any recall-only banks. A result whose text an
         earlier bank already returned is dropped.
@@ -1700,8 +1748,9 @@ class HindsightMemoryProvider(MemoryProvider):
         kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
         if self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
-        if self._recall_types:
-            kwargs["types"] = self._recall_types
+        recall_types = self._recall_types if types is None else types
+        if recall_types:
+            kwargs["types"] = recall_types
         if self._recall_min_scores:
             kwargs["min_scores"] = self._recall_min_scores
 
@@ -1742,7 +1791,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # Drop only what an earlier bank already returned; one bank's own answer passes
             # through untouched, so a single-bank recall is exactly the server's response.
             kept = [r for r in bank_results if getattr(r, "text", None) not in seen]
-            results.extend(kept)
+            results.extend(_BankRecallResult(bank_id=bank_id, memory=r) for r in kept)
             seen.update(text for r in kept if (text := getattr(r, "text", None)))
         return results
 
@@ -2103,7 +2152,9 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return (
+            [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, INVALIDATE_SCHEMA]
+        )
 
     def _tool_retain(self, args: dict) -> str:
         content, context = args["content"], args.get("context")
@@ -2129,10 +2180,23 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
+        types = args.get("types")
+        if types is not None and (
+            not isinstance(types, list)
+            or not types
+            or any(t not in ("world", "experience", "observation") for t in types)
+        ):
+            raise ValueError("types must be a non-empty list of world, experience, or observation")
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
-        results = self._recall(query)
+        results = self._recall_with_banks(query, types=types)
         logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        return (
+            "\n".join(
+                f"{i}. [memory_id={r.memory.id}, bank_id={r.bank_id}, type={r.memory.type}] {r.memory.text}"
+                for i, r in enumerate(results, 1)
+            )
+            or "No relevant memories found."
+        )
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
@@ -2143,16 +2207,43 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
         return text or "No relevant memories found."
 
+    def _tool_invalidate(self, args: dict) -> str:
+        memory_id = args["memory_id"]
+        bank_id = args.get("bank_id", self._bank_id)
+        # Recall includes read-only banks too. Curation must never fan out like retain,
+        # or silently target the primary when the recalled fact belongs to another bank.
+        if bank_id not in self._write_bank_ids:
+            raise ValueError(f"Bank '{bank_id}' is not writable by this provider")
+        from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest
+
+        request = UpdateMemoryRequest(state="invalidated")
+        if args.get("reason") is not None:
+            request.reason = args["reason"]
+        logger.debug("Tool hindsight_invalidate: bank=%s, memory_id=%s", bank_id, memory_id)
+        self._run_hindsight_operation(
+            lambda client: client.memory.update_memory(
+                bank_id=bank_id,
+                memory_id=memory_id,
+                update_memory_request=request,
+                _request_timeout=float(self._timeout or _DEFAULT_TIMEOUT),
+            )
+        )
+        logger.debug("Tool hindsight_invalidate: success")
+        return "Memory invalidated (kept for audit, excluded from recall)."
+
     # tool name -> (required arg, handler, user-facing failure prefix)
     _TOOL_HANDLERS = {
         "hindsight_retain": ("content", _tool_retain, "Failed to store memory"),
         "hindsight_recall": ("query", _tool_recall, "Failed to search memory"),
         "hindsight_reflect": ("query", _tool_reflect, "Failed to reflect"),
+        "hindsight_invalidate": ("memory_id", _tool_invalidate, "Failed to invalidate memory"),
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
+        if self._memory_mode == "context":
+            return tool_error("Memory tools are unavailable in context mode")
         required, handler, failure = self._TOOL_HANDLERS[tool_name]
         if not args.get(required, ""):
             return tool_error(f"Missing required parameter: {required}")

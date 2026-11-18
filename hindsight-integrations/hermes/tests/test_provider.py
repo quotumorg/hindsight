@@ -116,7 +116,10 @@ def test_recall_tool_queries_the_bank_and_formats_results(provider):
     assert fake.recalls[0]["bank_id"] == "team"
     assert fake.recalls[0]["budget"] == "high"
     assert fake.recalls[0]["types"] == ["observation"]  # observation-only default
-    assert result["result"] == "1. fact one\n2. fact two"
+    assert result["result"] == (
+        "1. [memory_id=memory-1, bank_id=team, type=observation] fact one\n"
+        "2. [memory_id=memory-2, bank_id=team, type=observation] fact two"
+    )
     instance.shutdown()
 
 
@@ -162,7 +165,7 @@ def test_recall_min_scores_is_enforced_on_each_result_the_server_returns(provide
     results = [("kept", {"semantic": 0.7}), ("weak", {"semantic": 0.3}), ("other arm", {"semantic": None})]
     instance, fake = provider({"recall_min_scores": {"semantic": 0.5}}, client=FakeClient(recall_texts=results))
     result = json.loads(instance.handle_tool_call("hindsight_recall", {"query": "q"}))
-    assert result["result"] == "1. kept"
+    assert result["result"] == "1. [memory_id=memory-1, bank_id=hermes, type=observation] kept"
     assert fake.recalls[0]["min_scores"] == {"semantic": 0.5}
     instance.shutdown()
 
@@ -253,6 +256,7 @@ def test_context_mode_hides_tools_tools_mode_skips_recall(provider):
         "hindsight_retain",
         "hindsight_recall",
         "hindsight_reflect",
+        "hindsight_invalidate",
     ]
     assert tools_only.prefetch("anything") == ""
     assert fake.recalls == []
@@ -374,10 +378,12 @@ def test_system_prompt_guides_tool_choice_only_when_tools_exist(provider):
         instance.shutdown()
 
     assert "session_search" not in blocks["context"]
+    assert "hindsight_invalidate" not in blocks["context"]
     assert "automatically injected" in blocks["context"]
     for mode in ("tools", "hybrid"):
         assert "prefer hindsight_recall over session_search" in blocks[mode]
         assert "hindsight_reflect" in blocks[mode] and "hindsight_retain" in blocks[mode]
+        assert "hindsight_invalidate" in blocks[mode]
     assert "automatically injected" in blocks["hybrid"]
     assert "automatically injected" not in blocks["tools"]
 
@@ -757,7 +763,7 @@ def test_reconnect_closes_the_client_it_replaces(provider, monkeypatch):
     monkeypatch.setattr(instance, "_new_embedded_client", lambda: fresh)
 
     result = json.loads(instance.handle_tool_call("hindsight_recall", {"query": "q"}))
-    assert result["result"] == "1. back"
+    assert result["result"] == "1. [memory_id=memory-1, bank_id=hermes, type=observation] back"
     assert Dead.closed
 
 

@@ -157,8 +157,10 @@ _spec.loader.exec_module(plugin)
 
 
 class FakeResult:
-    def __init__(self, text: str, scores: dict[str, float | None] | None = None):
+    def __init__(self, text: str, scores: dict[str, float | None] | None = None, *, memory_id: str = "memory-1"):
+        self.id = memory_id
         self.text = text
+        self.type = "observation"
         # Like the SDK's ``RecallResult``: an object with one attribute per stage, or ``None``.
         self.scores = types.SimpleNamespace(**scores) if scores is not None else None
 
@@ -166,7 +168,9 @@ class FakeResult:
 class FakeRecallResponse:
     def __init__(self, texts):
         """*texts* items are a text, or a ``(text, scores)`` pair when scores matter."""
-        self.results = [FakeResult(*(t if isinstance(t, tuple) else (t,))) for t in texts]
+        self.results = [
+            FakeResult(*(t if isinstance(t, tuple) else (t,)), memory_id=f"memory-{i}") for i, t in enumerate(texts, 1)
+        ]
 
 
 class FakeReflectResponse:
@@ -181,6 +185,8 @@ class FakeClient:
         self.retains: list[dict] = []
         self.recalls: list[dict] = []
         self.reflects: list[dict] = []
+        self.updates: list[dict] = []
+        self.memory = types.SimpleNamespace(update_memory=self._update_memory)
         self._recall_texts = list(recall_texts)
         self._reflect_text = reflect_text
 
@@ -195,6 +201,10 @@ class FakeClient:
     async def areflect(self, **kwargs):
         self.reflects.append(kwargs)
         return FakeReflectResponse(self._reflect_text)
+
+    async def _update_memory(self, **kwargs):
+        self.updates.append(kwargs)
+        return {"id": kwargs["memory_id"], "state": "invalidated"}
 
     async def aclose(self):
         pass
