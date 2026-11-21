@@ -430,6 +430,9 @@ INVALIDATE_SCHEMA = {
         "Surviving evidence is queued for rebuilding when automatic consolidation is enabled. "
         "Other copies or later retains may still assert the same information. "
         "Kept for audit; restore through the server curation API, not this tool. "
+        "This is not a deletion: the retained source document and its chunks still hold the original text. "
+        "Permanent removal is a server document delete, which also removes every fact extracted from it. "
+        "Tell the user the fact was retired, not erased. "
         "Observations cannot be invalidated. Targets one writable bank only; "
         "copies in other writable banks need their own call."
     ),

@@ -387,6 +387,10 @@ usual text format and deduplication. Observations are derived and cannot be inva
 Invalidation archives this raw fact and removes observations linked to it. Surviving evidence is
 queued for rebuilding when automatic consolidation is enabled. Other copies or later retains may
 still assert the same information. The fact is kept for audit, not permanently deleted.
+Invalidation does not touch the retained source: the document and its chunks keep the original
+text. To remove it for good, delete the document through the server API
+(`DELETE /v1/default/banks/{bank_id}/documents/{document_id}`), which also deletes every memory
+unit extracted from that document and cannot be undone. The Hermes tool does not do this.
 Restoration is outside the Hermes tool; use the server's curation API or MCP's restore option.
 Store the replacement fact with `hindsight_retain` when needed.
 

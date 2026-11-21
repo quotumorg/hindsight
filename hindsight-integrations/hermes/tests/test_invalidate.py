@@ -424,5 +424,7 @@ def test_tool_descriptions_limit_the_invalidation_claim():
     assert "Other copies or later retains may still assert the same information." in description
     assert "restore through the server curation API, not this tool" in description
     assert "other writable banks need their own call" in description
+    assert "the retained source document and its chunks still hold the original text" in description
+    assert "retired, not erased" in description
     assert "With explicit types" in plugin.RECALL_SCHEMA["description"]
     assert "multiple banks are searched" in plugin.RECALL_SCHEMA["description"]
